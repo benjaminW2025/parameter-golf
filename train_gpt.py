@@ -644,6 +644,9 @@ class Block(nn.Module):
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
+# -----------------------
+# Baseline model
+# -----------------------
 
 class GPT(nn.Module):
     def __init__(
@@ -723,6 +726,110 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
+# ----------------------------
+# UTransformer Code
+# ----------------------------
+
+class EncoderLayer(nn.Module):
+    """
+    Class for a SINGLE encoder layer in the UTransformer
+    """
+    def __init__(self, d_model, num_heads, num_kv_heads, rope_base, d_ff, layer_dropout = 0.0, ff_dropout=0.0, attn_mask=True, qk_gain_init=1.5):
+        """
+        Args:
+            d_embed: the dimension of the embeddings
+            num_heads: number of attenion heads
+            d_ff: dimension of hidden layers in ffnn
+            layer_dropuot: dropout used by this encoder layer
+            attn_dropout: dropout used for attention
+            ff_dropout: dropout used for the feed forward net
+            attn_mask: boolean value to pass through MHA forward pass
+        """
+        super.__init__()
+
+        self.mha = CausalSelfAttention(d_model, num_heads, num_kv_heads, rope_base, qk_gain_init=qk_gain_init)
+        self.feed_forward = FeedForward(d_model, d_ff, d_model, layer_config='ll', padding='both', dropout=ff_dropout)
+        
+        self.dropout = nn.Dropout(layer_dropout)
+        self.layer_norm_mha = nn.LayerNorm(d_model)
+        self.layer_norm_ffnn = nn.LayerNorm(d_model)
+    
+    def forward(self, x):
+        # Apply first layer norm and MHA
+        x = self.layer_norm_mha(x)
+
+        # Get attention output
+        y = self.mha(x)
+
+        # Residual + dropout
+        x = self.dropout(x + y)
+
+        # Layer norm for ffnn
+        y = self.layer_norm_ffnn(x)
+
+        # Feed forward
+        y = self.feed_forward(x)
+
+        # Residual + dropout
+        x = self.dropout(x + y)
+
+        return x
+
+class FeedForward(nn.Module):
+    """
+    The feedforward transition function for the encoder
+    layer. Simple feedforward network with a single
+    hidden layer.
+    """
+    def __init__(self, d_input, d_model, d_output, model_config='ll', padding='left', dropout=0.0):
+        """
+        Args:
+            d_input: dimension of the input
+            d_model: dimension of the hidden layer
+            d_output: dimension of the output
+            model_config: ll -> fully connected neural net
+            lc -> convolutional network
+            padding: 
+            dropout: model dropout to stabilize training
+        """
+        super.__init__()
+
+        layers = []
+
+        # Idea here is first linear project d_input -> d_model
+        # Then for hidden layers project d_model -> d_model
+        # For final output projection d_model -> d_output
+        sizes = ([(d_input, d_model)] + 
+                 [(d_model, d_model)]*(len(model_config)-2) + 
+                 [(d_model, d_output)])
+
+        for layer, size in zip(list(model_config), sizes):
+            if layer == 'l':
+                layers.append(nn.Linear(*size))
+            # elif layer == 'c':
+                # Still need to write the convolution class, but for now feedforward should make due
+                # layers.append(Conv(*size, kernel_size=3, pad_type=padding))
+            else:
+                raise ValueError("Unknown layer type {}".format(layer))
+
+        self.layers = nn.ModuleList(layers)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        for num, layer in enumerate(self.layers):
+            x = layer(x)
+            # Apply non-linearity and dropout for hidden layers
+            if num < len(self.layers):
+                x = self.relu(x)
+                x = self.dropout(x)
+
+        # return
+        return x
+
+# ----------------------------
+# UTransformer Model
+# ----------------------------
 
 # -----------------------------
 # TRAINING
