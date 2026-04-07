@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_recurr = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -649,10 +649,11 @@ class Block(nn.Module):
 # -----------------------
 
 class GPT(nn.Module):
+    # What need to change? Need a fixed depth-recurrence parameter
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        num_recurr: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -670,13 +671,12 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = num_recurr // 2
+        self.num_decoder_layers = num_recurr - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
+        # Share weights -> we can up depth of attention mechanism
+        self.block = Block(
                     model_dim,
                     num_heads,
                     num_kv_heads,
@@ -684,9 +684,6 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
-            ]
-        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -706,14 +703,13 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.block(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.block(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -725,115 +721,6 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
-
-# ----------------------------
-# UTransformer Code
-# ----------------------------
-
-class EncoderLayer(nn.Module):
-    """
-    Class for a SINGLE encoder layer in the UTransformer
-    """
-    def __init__(self, d_model, num_heads, num_kv_heads, rope_base, d_ff, layer_dropout = 0.0, ff_dropout=0.0, attn_mask=True, qk_gain_init=1.5):
-        """
-        Args:
-            d_embed: the dimension of the embeddings
-            num_heads: number of attenion heads
-            d_ff: dimension of hidden layers in ffnn
-            layer_dropuot: dropout used by this encoder layer
-            attn_dropout: dropout used for attention
-            ff_dropout: dropout used for the feed forward net
-            attn_mask: boolean value to pass through MHA forward pass
-        """
-        super.__init__()
-
-        self.mha = CausalSelfAttention(d_model, num_heads, num_kv_heads, rope_base, qk_gain_init=qk_gain_init)
-        self.feed_forward = FeedForward(d_model, d_ff, d_model, layer_config='ll', padding='both', dropout=ff_dropout)
-        
-        self.dropout = nn.Dropout(layer_dropout)
-        self.layer_norm_mha = nn.LayerNorm(d_model)
-        self.layer_norm_ffnn = nn.LayerNorm(d_model)
-    
-    def forward(self, x):
-        # Apply first layer norm and MHA
-        x = self.layer_norm_mha(x)
-
-        # Get attention output
-        y = self.mha(x)
-
-        # Residual + dropout
-        x = self.dropout(x + y)
-
-        # Layer norm for ffnn
-        y = self.layer_norm_ffnn(x)
-
-        # Feed forward
-        y = self.feed_forward(x)
-
-        # Residual + dropout
-        x = self.dropout(x + y)
-
-        return x
-
-class FeedForward(nn.Module):
-    """
-    The feedforward transition function for the encoder
-    layer. Simple feedforward network with a single
-    hidden layer.
-    """
-    def __init__(self, d_input, d_model, d_output, model_config='ll', padding='left', dropout=0.0):
-        """
-        Args:
-            d_input: dimension of the input
-            d_model: dimension of the hidden layer
-            d_output: dimension of the output
-            model_config: ll -> fully connected neural net
-            lc -> convolutional network
-            padding: 
-            dropout: model dropout to stabilize training
-        """
-        super.__init__()
-
-        layers = []
-
-        # Idea here is first linear project d_input -> d_model
-        # Then for hidden layers project d_model -> d_model
-        # For final output projection d_model -> d_output
-        sizes = ([(d_input, d_model)] + 
-                 [(d_model, d_model)]*(len(model_config)-2) + 
-                 [(d_model, d_output)])
-
-        for layer, size in zip(list(model_config), sizes):
-            if layer == 'l':
-                layers.append(nn.Linear(*size))
-            # elif layer == 'c':
-                # Still need to write the convolution class, but for now feedforward should make due
-                # layers.append(Conv(*size, kernel_size=3, pad_type=padding))
-            else:
-                raise ValueError("Unknown layer type {}".format(layer))
-
-        self.layers = nn.ModuleList(layers)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        for num, layer in enumerate(self.layers):
-            x = layer(x)
-            # Apply non-linearity and dropout for hidden layers
-            if num < len(self.layers):
-                x = self.relu(x)
-                x = self.dropout(x)
-
-        # return
-        return x
-
-# ----------------------------
-# UTransformer Model
-# ----------------------------
-
-# -----------------------------
-# TRAINING
-# -----------------------------
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -932,7 +819,7 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        num_recurr=args.num_recurr,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -949,13 +836,16 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    
+    total_params = sum(p.numel() for p in base_model.parameters())
+    print(f"Total Parameters: {total_params:,}")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.block.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
