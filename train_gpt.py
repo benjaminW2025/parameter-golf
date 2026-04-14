@@ -46,24 +46,24 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 32768))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
+    iterations = int(os.environ.get("ITERATIONS", 500))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 32768))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_recurr = int(os.environ.get("NUM_LAYERS", 9))
+    num_recurr = int(os.environ.get("NUM_RECURR", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 1024))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -643,6 +643,24 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+    
+def generate_sinusoidal(timesteps, d_model):
+    """
+    Generate the sinusoidal encodings used for timestep encoding
+    instead of positional encoding in this case
+    """
+    # Calculate the argument used for sinusoidals
+    argument = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000) / d_model))
+
+    timestep = torch.arange(timesteps, dtype=torch.float).unsqueeze(1)
+    encodings = torch.zeros(timesteps, d_model)
+
+    encodings[:, 0::2] = torch.sin(timestep * argument)
+    encodings[:, 1::2] = torch.cos(timestep * argument)
+
+    encodings = encodings.unsqueeze(0)
+
+    return encodings
 
 # -----------------------
 # Baseline model
@@ -653,6 +671,7 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
+        num_layers: int,
         num_recurr: int,
         model_dim: int,
         num_heads: int,
@@ -663,16 +682,19 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        device
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
+        self.num_layers = num_layers
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_recurr // 2
         self.num_decoder_layers = num_recurr - self.num_encoder_layers
+        self.timesteps = generate_sinusoidal(num_recurr, model_dim)
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Share weights -> we can up depth of attention mechanism
@@ -686,6 +708,7 @@ class GPT(nn.Module):
                 )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.device = device
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
@@ -698,15 +721,20 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        # We need a way to apply the timestep embeddings
+        step = 0
+
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
+            x = x + self.timesteps[:, i, :].to(self.device)
             x = self.block(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            x = x + self.timesteps[:, self.num_encoder_layers + i, :].to(self.device)
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.block(x, x0)
@@ -829,6 +857,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        device=device
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
