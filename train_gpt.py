@@ -46,25 +46,25 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 32768))
+    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 131072))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 500))
+    iterations = int(os.environ.get("ITERATIONS", 30000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 32768))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 131072))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
-    num_recurr = int(os.environ.get("NUM_RECURR", 3))
+    num_layers = int(os.environ.get("NUM_LAYERS", 4))
+    num_recurr = int(os.environ.get("NUM_RECURR", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1024))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -748,9 +748,9 @@ class GPT(nn.Module):
             skips.append(x)
 
             # Third pass
-            x = x + self.timesteps[:, i*self.num_recurr+2, :].unsqueeze(1)
-            x = self.blocks[i](x, x0)
-            skips.append(x)
+            # x = x + self.timesteps[:, i*self.num_recurr+2, :].unsqueeze(1)
+            # x = self.blocks[i](x, x0)
+            # skips.append(x)
         for i in range(self.num_decoder_layers):
             # First pass
             if skips:
@@ -765,10 +765,10 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
             # Third pass
-            if skips:
-                x = x + self.skip_weights[i*self.num_recurr+2].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = x + self.timesteps[:, self.num_encoder_layers*self.num_recurr + i*self.num_recurr + 2, :].unsqueeze(1)
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            # if skips:
+                # x = x + self.skip_weights[i*self.num_recurr+2].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            # x = x + self.timesteps[:, self.num_encoder_layers*self.num_recurr + i*self.num_recurr + 2, :].unsqueeze(1)
+            # x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -906,7 +906,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.block.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
