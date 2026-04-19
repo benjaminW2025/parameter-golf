@@ -61,11 +61,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_recurr = int(os.environ.get("NUM_RECURR", 2))
-    layers_recurr = [int(x) for x in os.environ.get("LAYERS_RECURR", "0,1,2").split(",")]
+    layers_recurr = [int(x) for x in os.environ.get("LAYERS_RECURR", "6,7,8").split(",")]
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -112,7 +112,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float = 0.0, momentum: float = 0.95, backend_steps: int = 5, nesterov: bool = True):
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
@@ -699,8 +699,9 @@ class GPT(nn.Module):
         # layers_recurr is the count of initial layers that get recurred twice
         self.num_recurr_layers = len(layers_recurr)
         total_passes = self.num_recurr_layers * 2 + (num_layers - self.num_recurr_layers)
-        self.register_buffer('timesteps', generate_sinusoidal(total_passes, model_dim))
-        self.num_skip_weights = self.num_recurr_layers
+        self.step_emb = nn.Embedding(total_passes, model_dim)
+        early_layers = num_layers - self.num_recurr_layers
+        self.num_skip_weights = early_layers + self.num_recurr_layers  # early→late_pass1 + late_pass1→late_pass2
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Share weights -> we can up depth of attention mechanism
         self.blocks = nn.ModuleList(
@@ -736,26 +737,32 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         count = 0
         skip_idx = 0
+        early_layers = self.num_layers - self.num_recurr_layers
 
-        # First pass through recurred layers — no skip pushes
-        for i in range(self.num_recurr_layers):
-            x = x + self.timesteps[:, count, :].unsqueeze(1)
-            count += 1
-            x = self.blocks[i](x, x0)
-
-        # Second pass through recurred layers — push skips
-        for i in range(self.num_recurr_layers):
-            x = x + self.timesteps[:, count, :].unsqueeze(1)
+        # Early layers — run once, push skips for late first pass
+        for i in range(early_layers):
+            x = x + self.step_emb.weight[count][None, None, :]
             count += 1
             x = self.blocks[i](x, x0)
             skips.append(x)
 
-        # Tail layers — pop skips from second recurrence
-        for i in range(self.num_recurr_layers, self.num_layers):
+        # Late layers first pass — pop early skips, push skips for second pass
+        late_skips: list[Tensor] = []
+        for i in range(early_layers, self.num_layers):
             if skips:
                 x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 skip_idx += 1
-            x = x + self.timesteps[:, count, :].unsqueeze(1)
+            x = x + self.step_emb.weight[count][None, None, :]
+            count += 1
+            x = self.blocks[i](x, x0)
+            late_skips.append(x)
+
+        # Late layers second pass — pop late_pass1 skips
+        for i in range(early_layers, self.num_layers):
+            if late_skips:
+                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * late_skips.pop()
+                skip_idx += 1
+            x = x + self.step_emb.weight[count][None, None, :]
             count += 1
             x = self.blocks[i](x, x0)
 
@@ -867,8 +874,9 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers = args.num_layers,
+        num_layers=args.num_layers,
         num_recurr=args.num_recurr,
+        layers_recurr=args.layers_recurr,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -896,20 +904,18 @@ def main() -> None:
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
-        p
-        for name, p in block_named_params
+        p for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
-        p
-        for name, p in block_named_params
+        p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight, base_model.step_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,

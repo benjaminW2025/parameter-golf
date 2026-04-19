@@ -1,8 +1,10 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
+Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
+
+# Test for 3 layer 3 recurrence, push to pop skip connection structure to compare learning per step for recurrent set up
 
 from __future__ import annotations
 
@@ -61,9 +63,10 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 3))
+    num_recurr = int(os.environ.get("NUM_RECURR", 3))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 896))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -604,17 +607,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # SwiGLU MLP: same param count as relu^2 by using hidden = 2/3 * mlp_mult * dim * 2
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        hidden = int(2 * mlp_mult * dim / 3)  # matches relu^2 param count: 3*dim*hidden = 2*mlp_mult*dim^2
+        self.fc = CastedLinear(dim, hidden * 2, bias=False)  # gate + value
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        x, gate = self.fc(x).chunk(2, dim=-1)
+        return self.proj(x * F.silu(gate))
 
 
 class Block(nn.Module):
@@ -650,6 +653,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_recurr: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -664,13 +668,24 @@ class GPT(nn.Module):
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
+        self.num_recurr = num_recurr
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # Fixed sinusoidal step embeddings, one per (layer, recurrence pass) pair.
+        total_steps = num_layers * num_recurr
+        positions = torch.arange(total_steps, dtype=torch.float32).unsqueeze(1)
+        half = model_dim // 2
+        freqs = torch.exp(torch.arange(half, dtype=torch.float32) * (-math.log(10000.0) / half))
+        emb = torch.zeros(total_steps, model_dim)
+        emb[:, 0::2] = torch.sin(positions * freqs)
+        emb[:, 1::2] = torch.cos(positions * freqs)
+        self.register_buffer("step_emb", emb)
+        # One skip weight per encoder layer: pushed after last encoder pass, popped in reverse at first decoder pass.
+        num_skips = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(num_skips, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -681,7 +696,7 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for _ in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -701,16 +716,27 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
+        count = 0
 
-        # First half stores skips; second half reuses them in reverse order.
+        # Encoder: each layer runs num_recurr times; push output after last pass.
+        skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            for _ in range(self.num_recurr):
+                x = x + self.step_emb[count][None, None, :]
+                count += 1
+                x = self.blocks[i](x, x0)
             skips.append(x)
+
+        # Decoder: pop skips in reverse (mirrored) at first pass of each decoder layer.
+        skip_idx = 0
         for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            for r in range(self.num_recurr):
+                if r == 0 and skips:
+                    x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    skip_idx += 1
+                x = x + self.step_emb[count][None, None, :]
+                count += 1
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -826,6 +852,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_recurr=args.num_recurr,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
